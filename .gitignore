@@ -1,0 +1,11 @@
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+*.tfvars
+lambda/*.zip
+backend.tf
+
+# OS
+Thumbs.db

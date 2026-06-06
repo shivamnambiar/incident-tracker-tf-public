@@ -1,0 +1,139 @@
+name: CI/CD
+#on: #commented out so pipeline doesn't actually trigger on my public repo
+#  push:
+#    branches:
+#      - main
+#  pull_request:
+#    branches:
+#      - main
+#  workflow_dispatch:
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_alert_email: ${{ secrets.TF_VAR_ALERT_EMAIL }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/IncidentTrackerGitHubActionsRole
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: .terraform/providers
+          key: terraform-${{ hashFiles('.terraform.lock.hcl') }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: |
+          terraform plan -no-color 2>&1 | tee plan_output.txt
+
+      - name: Upload plan output
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-output
+          path: plan_output.txt
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    env:
+      TF_VAR_alert_email: ${{ secrets.TF_VAR_ALERT_EMAIL }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/IncidentTrackerGitHubActionsRole
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: Restore Terraform provider cache
+        uses: actions/cache@v4
+        with:
+          path: .terraform/providers
+          key: terraform-${{ hashFiles('.terraform.lock.hcl') }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      - name: Deploy frontend
+        id: deploy_frontend
+        run: |
+          API_URL=$(terraform output -raw api_gateway_url)
+          COGNITO_DOMAIN=$(terraform output -raw cognito_hosted_ui_url)
+          CLIENT_ID=$(terraform output -raw cognito_client_id)
+          CLOUDFRONT_URL=$(terraform output -raw cloudfront_url)
+          S3_BUCKET=$(terraform output -raw s3_bucket_name)
+
+          sed -e "s|__API_URL__|$API_URL|g" \
+            -e "s|__COGNITO_DOMAIN__|$COGNITO_DOMAIN|g" \
+            -e "s|__CLIENT_ID__|$CLIENT_ID|g" \
+            -e "s|__CLOUDFRONT_URL__|$CLOUDFRONT_URL|g" \
+            index.html > index_deployed.html
+
+          LOCAL_HASH=$(md5sum index_deployed.html | awk '{print $1}')
+          DEPLOYED_HASH=$(aws s3api head-object --bucket $S3_BUCKET --key index.html --query 'ETag' --output text 2>/dev/null | tr -d '"')
+
+          if [ "$LOCAL_HASH" != "$DEPLOYED_HASH" ]; then
+            echo "Frontend changed, deploying..."
+            aws s3 cp index_deployed.html s3://$S3_BUCKET/index.html --content-type text/html
+            echo "frontend_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No frontend changes, skipping"
+            echo "frontend_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Invalidate CloudFront cache
+        if: steps.deploy_frontend.outputs.frontend_changed == 'true'
+        run: |
+          CLOUDFRONT_ID=$(terraform output -raw cloudfront_distribution_id)
+          aws cloudfront create-invalidation \
+            --distribution-id $CLOUDFRONT_ID \
+            --paths "/*"

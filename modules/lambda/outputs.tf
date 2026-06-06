@@ -1,0 +1,13 @@
+# modules/lambda/outputs.tf
+
+output "function_name" {
+  value = aws_lambda_function.this.function_name
+}
+
+output "invoke_arn" {
+  value = aws_lambda_function.this.invoke_arn
+}
+
+output "arn" {
+  value = aws_lambda_function.this.arn
+}
