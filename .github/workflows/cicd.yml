@@ -38,7 +38,8 @@ jobs:
             -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
             -backend-config="key=terraform.tfstate" \
             -backend-config="region=${{ vars.AWS_REGION }}" \
-            -backend-config="encrypt=true"
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
 
       - name: Cache Terraform providers
         uses: actions/cache@v4
